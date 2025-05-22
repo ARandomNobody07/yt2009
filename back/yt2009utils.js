@@ -21,6 +21,14 @@ const androidHeaders = {"headers": {
 const wlist = /discord.gg|tiktok|tik tok|pre-vevo|2023|lnk.to|official hd video|smarturl/gui
 let ip_uses_flash = []
 let ratelimitData = {}
+let ytConfigData = false;
+const playerResponsePb = require("./proto/android_player_pb")
+
+function devlog(text) {
+    if(config.env == "dev") {
+        console.log(text)
+    }
+}
 
 module.exports = {
     "time_to_seconds": function(input) {
@@ -74,11 +82,30 @@ module.exports = {
 
 
     "comments_viewmodel_parser": function(response, comment_flags) {
-        if(config.env == "dev") {
-            console.log("[dev] using comments_viewmodel_parser instead")
+        devlog("[dev] using comments_viewmodel_parser instead")
+        let firstPinned = false;
+        try {
+            response.onResponseReceivedEndpoints.forEach(e => {
+                if(e.reloadContinuationItemsCommand
+                && e.reloadContinuationItemsCommand.continuationItems
+                && e.reloadContinuationItemsCommand.continuationItems[0]
+                && e.reloadContinuationItemsCommand.continuationItems[0]
+                .commentThreadRenderer) {
+                    let first = e.reloadContinuationItemsCommand
+                                 .continuationItems[0]
+                                 .commentThreadRenderer
+                                 .commentViewModel
+                                 .commentViewModel;
+                    if(first.pinnedText) {
+                        firstPinned = true;
+                    }
+                }
+            })
         }
+        catch(error) {}
         let comments = []
         try {
+            let i = 0;
             response.frameworkUpdates.entityBatchUpdate.mutations.forEach(m => {
                 if(m.payload
                 && m.payload.commentEntityPayload) {
@@ -98,21 +125,15 @@ module.exports = {
                         "likes": parseInt(m.toolbar.likeCountA11y.replace(
                             /[^0-9]/g, ""
                         )),
-                        "pinned": false
+                        "pinned": (i == 0 && firstPinned)
                     })
+                    i++
                 }
             })
 
             return comments;
         }
         catch(error) {
-            console.log(`
-    COMMENTVIEWMODEL PARSER FAIL: ${error}
-    REPRO DATA: ${constants.headers.cookie}
-    ${constants.cached_innertube_context.client.deviceExperimentId}
-    ${constants.cached_innertube_context.client.visitorData}
-    PLEASE REPORT AN ISSUE AT: https://github.com/ftde0/yt2009/
-`)
             return []
         }
     },
@@ -585,7 +606,7 @@ module.exports = {
                     fs.writeFileSync(`../assets/${fname}.png`, buffer)
                 })
             }).catch(e => {
-                console.log("googleusercontent load fail! trying ggpht")
+                devlog("googleusercontent load fail! trying ggpht")
                 fetch(link, {
                     "headers": constants.headers
                 }).then(r => {
@@ -593,7 +614,7 @@ module.exports = {
                         fs.writeFileSync(`../assets/${fname}.png`, buffer)
                     })
                 }).catch(e => {
-                    console.log("attempt 2 of loading user avatar fail!", link)
+                    devlog("attempt 2 of loading user avatar fail!", link)
                 })
             })
         }
@@ -1079,25 +1100,6 @@ module.exports = {
         this.saveMp4_android(id, (() => {
             callback(`../assets/${id}`)
         }))
-        /*let targetFilePath = `../assets/${id}.mp4`
-        let writeStream = fs.createWriteStream(targetFilePath)
-        writeStream.on("finish", () => {
-            callback(targetFilePath.replace(".mp4", ""))
-        })
-    
-        ytdl(`https://youtube.com/watch?v=${id}`, {
-            "quality": 18
-        })
-        .on("error", (error) => {
-            if(extended) {
-                callback(error)
-            } else {
-                callback(false)
-            }
-            writeStream.close()
-            return;
-        })
-        .pipe(writeStream)*/
     },
 
     "testF18": function(url, callback) {
@@ -1111,6 +1113,7 @@ module.exports = {
     "saveMp4_android": function(id, callback, existingPlayer, quality) {
         let testF18 = this.testF18;
         let downloadInParts_file = this.downloadInParts_file;
+        let funcRef = this.saveMp4_android;
 
         function parseResponse(r) {
             // parse formats
@@ -1131,6 +1134,9 @@ module.exports = {
             }
             // add h264 dash formats
             let audioFormats = []
+            if(!r.streamingData.adaptiveFormats) {
+                r.streamingData.adaptiveFormats = []
+            }
             r.streamingData.adaptiveFormats.forEach(q => {
                 if(q.mimeType.includes("audio/mp4")) {
                     if(q.audioTrack && q.audioTrack.audioIsDefault) {
@@ -1166,29 +1172,66 @@ module.exports = {
             }
 
             if(downloadAudio) {
+
+                let c = yt2009exports.read().verboseDownloadProgress[fname]
+                c.state = "DOWNLOADING"
+                c.type = "DASH"
+                yt2009exports.extendWrite(
+                    "verboseDownloadProgress", fname, c
+                )
+
                 downloadInParts_file(
                     h264DashAudioUrl,
                     "../assets/" + id + "-audio.m4a",
-                    (() => {
+                    ((feedback) => {
+                        if(feedback == "RETRY") {
+                            devlog("RETRY download audio")
+                            downloadInParts_file(
+                                h264DashAudioUrl,
+                                "../assets/" + id + "-audio.m4a",
+                                (f) => {
+                                    if(feedback !== "RETRY") {
+                                        audioDownloadDone = true;
+                                        if(audioDownloadDone
+                                        && videoDownloadDone) {
+                                            onFormatsDone()
+                                        }
+                                    } else {
+                                        callback(false)
+                                        return;
+                                    }
+                                },
+                                true
+                            )
+                            return;
+                        }
                         audioDownloadDone = true;
                         if(audioDownloadDone && videoDownloadDone) {
                             onFormatsDone()
                         }
-                    })
+                    }),
+                    fname
                 )
             } else {
                 testF18(qualities[quality].url, (working) => {
                     if(working) {
+                        let c = yt2009exports.read().verboseDownloadProgress[fname]
+                        c.state = "DOWNLOADING"
+                        c.type = "NONDASH"
+                        yt2009exports.extendWrite(
+                            "verboseDownloadProgress", fname, c
+                        )
                         downloadInParts_file(
                             qualities[quality].url,
                             "../assets/" + fname + ".mp4",
-                            (() => {
+                            ((feedback) => {
                                 callback(`${fname}.mp4`)
                                 yt2009exports.updateFileDownload(`${fname}`, 2)
-                            })
+                            }),
+                            fname
                         )
                     } else {
-                        this.saveMp4_android(id, callback, r, quality)
+                        funcRef(id, callback, r, quality)
                     }
                 })
                 return;
@@ -1211,7 +1254,7 @@ module.exports = {
                 for(let q in qualities) {
                     qlist.push(q)
                 }
-                quality = q;
+                quality = qlist[0];
             }
             if(!qualities[quality]) {
                 callback(false)
@@ -1222,12 +1265,33 @@ module.exports = {
             downloadInParts_file(
                 qualities[quality].url,
                 "../assets/" + id + "-temp-" + quality + ".mp4",
-                (() => {
+                ((feedback) => {
+                    if(feedback == "RETRY") {
+                        devlog("RETRY dash video download")
+                        downloadInParts_file(
+                            qualities[quality].url,
+                            "../assets/" + id + "-temp-" + quality + ".mp4",
+                            ((feedback) => {
+                                devlog("retry status: " + feedback)
+                                if(feedback !== "RETRY") {
+                                    videoDownloadDone = true;
+                                    if(audioDownloadDone || !downloadAudio) {
+                                        onFormatsDone()
+                                    }
+                                } else {
+                                    callback(false)
+                                }
+                            }),
+                            fname
+                        )
+                        return;
+                    }
                     videoDownloadDone = true;
                     if(audioDownloadDone || !downloadAudio) {
                         onFormatsDone()
                     }
-                })
+                }),
+                fname
             )
 
             // merge formats once both are ready
@@ -1237,6 +1301,19 @@ module.exports = {
                     audioPath = "../assets/" + id + ".mp4"
                 }
                 let videoPath = "../assets/" + id + "-temp-" + quality + ".mp4"
+
+                if(yt2009exports.read().verboseDownloadProgress[fname]) {
+                    let c = yt2009exports.read().verboseDownloadProgress[fname]
+                    c.state = "MERGE_STARTED"
+                    try {
+                        c.videoFileSize = fs.statSync(videoPath).size;
+                        c.audioFileSize = fs.statSync(audioPath).size;
+                    }
+                    catch(error) {}
+                    yt2009exports.extendWrite(
+                        "verboseDownloadProgress", fname, c
+                    )
+                }
 
                 let cmd = [
                     "ffmpeg",
@@ -1287,21 +1364,87 @@ module.exports = {
         }
 
         yt2009exports.updateFileDownload(fname, 1)
+        yt2009exports.extendWrite(
+            "verboseDownloadProgress", fname, {"state": "STARTED"}
+        )
 
+        /* can't use cached players for now
         if(yt2009exports.read().players[id]) {
             parseResponse(yt2009exports.read().players[id])
             setTimeout(() => {
                 yt2009exports.delete("players", id)
             }, 200)
             return;
-        }
+        }*/
 
         let rHeaders = JSON.parse(JSON.stringify(constants.headers))
-        rHeaders["user-agent"] = "com.google.android.youtube/19.02.39 (Linux; U; Android 14) gzip"
+        rHeaders["user-agent"] = "com.google.android.youtube/20.06.36 (Linux; U; Android 14) gzip"
         if(yt2009signin.needed() && yt2009signin.getData().yAuth) {
             let d = yt2009signin.getData().yAuth
             rHeaders.Authorization = `Bearer ${d}`
         }
+
+        const formatRequestMode = "protobuf"
+
+        if(formatRequestMode == "protobuf") {
+            rHeaders["Content-Type"] = "application/x-protobuf"
+            rHeaders["x-goog-api-format-version"] = "2"
+            this.craftPlayerProto(id, (pbmsg) => {
+                fetch("https://youtubei.googleapis.com/youtubei/v1/player", {
+                    "headers": rHeaders,
+                    "method": "POST",
+                    "body": pbmsg
+                }).then(r => {r.buffer().then(b => {
+                    let resp = playerResponsePb.root.deserializeBinary(b)
+                    let formats = resp.toObject().formatsList[0]
+                    let bp = {} //bp -- backport
+                    function backportFormat(f) {
+                        let a = JSON.parse(JSON.stringify(f))
+                        a.qualityLabel = f.qualitylabel;
+                        a.bitrate = f.totalbitrate;
+                        a.mimeType = f.mimetype;
+                        if(f.audiotrackList && f.audiotrackList[0]) {
+                            let at = f.audiotrackList[0]
+                            a.audioTrack = {
+                                "label": at.displayname,
+                                "vss_id": at.vssid,
+                                "audioIsDefault": Boolean(at.isdefault)
+                            }
+                        }
+                        return a;
+                    }
+                    if(!formats) {
+                        parseResponse(bp)
+                        return;
+                    }
+                    if(formats.nondashformatList) {
+                        if(!bp.streamingData) {
+                            bp.streamingData = {}
+                        }
+                        bp.streamingData.formats = []
+                        formats.nondashformatList.forEach(f => {
+                            bp.streamingData.formats.push(backportFormat(f))
+                        })
+                    }
+                    if(formats.dashformatList) {
+                        if(!bp.streamingData) {
+                            bp.streamingData = {}
+                        }
+                        bp.streamingData.adaptiveFormats = []
+                        formats.dashformatList.forEach(f => {
+                            bp.streamingData.adaptiveFormats.push(
+                                backportFormat(f)
+                            )
+                        })
+                    }
+    
+                    //console.log("using protoported response", bp)
+                    parseResponse(bp)
+                })})
+            })
+            return;
+        }
+
         fetch("https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8", {
             "headers": rHeaders,
             "referrer": "https://www.youtube.com/watch?v=" + id,
@@ -1363,7 +1506,7 @@ module.exports = {
         })})
     },
 
-    "downloadInParts_file": function(url, out, callback) {
+    "downloadInParts_file": function(url, out, callback, metadata) {
         let partSize = 0;
         let partNumber = 0;
         let startB = 0;
@@ -1385,19 +1528,46 @@ module.exports = {
                     partSize = 1000000 + Math.floor(Math.random() * 300000)
                 }
                 default: {
-                    partSize = 1600000 + Math.floor(Math.random() * 500000)
+                    partSize = 1600000 + Math.floor(Math.random() * 300000)
                 }
             }
         }
-        const stream = fs.createWriteStream(out, { flags: 'a' });
+        const stream = fs.createWriteStream(out, {flags: "w"});
         function fetchNextPart() {
             adjustPartsize()
             const newHeaders = { ...androidHeaders };
             newHeaders.headers.range = `bytes=${startB}-${startB + partSize}`;
             fetch(url, newHeaders).then(r => {
+                /*if(r.status !== 200 && r.status !== 206) {
+                    console.log(url, newHeaders.headers.range, r.status, partSize)
+                } else {
+                    console.log(partSize, "200")
+                }*/
+                if(r.status == 403) {
+                    stream.end()
+                    try {fs.unlinkSync(out)}catch(error){
+                        try {fs.writeFileSync(out, "")}
+                        catch(error){}
+                    }
+                    callback("RETRY")
+                    return;
+                }
+                if(r.headers.get("content-range")
+                && r.headers.get("content-range").includes("/")
+                && metadata) {
+                    let f = metadata
+                    let cdata = yt2009exports.read().verboseDownloadProgress[f]
+                    if(cdata) {
+                        cdata.reportLength = r.headers.get("content-range")
+                                                      .split("/")[1];
+                        yt2009exports.extendWrite(
+                            "verboseDownloadProgress", metadata, cdata
+                        )
+                    }
+                }
                 if (r.headers.get('Content-Length') === '0') {
                     stream.end();
-                    return callback();
+                    return callback("ALRIGHT");
                 }
                 r.body.pipe(stream, { end: false });
                 r.body.on('end', () => {
@@ -1464,6 +1634,7 @@ module.exports = {
     },
 
     "relativeToAbsoluteApprox": function(relativeTime) {
+        relativeTime = relativeTime.replace("Streamed live", "").trim()
         relativeTime = relativeTime.replace("Streamed", "").trim()
         let current = new Date()
         let year = current.getFullYear()
@@ -1478,9 +1649,7 @@ module.exports = {
                 year--;
                 month = current.getMonth()
             }
-        } else if(relativeTime.includes("day")
-               || relativeTime.includes("hour")
-               || relativeTime.includes("minute")) {
+        } else if(relativeTime.includes("day")) {
             day -= parseInt(relativeTime.split(" ")[0])
             if(day < 1) {
                 month--;
@@ -1637,6 +1806,10 @@ module.exports = {
     },
 
     "fakeDatesModern": function(req, uploadDate) {
+        if(req && req.headers && req.headers.cookie
+        && !req.headers.cookie.includes("fake_dates")) {
+            return uploadDate;
+        }
         let date = Date.now()
         if(typeof(req) == "string") {
             date = req;
@@ -1851,6 +2024,177 @@ module.exports = {
         }
 
         return false;
+    },
+
+    "craftPlayerProto": function(id, callback) {this.getYtConfig(cfg => {
+        const p = require("./proto/android_player_request_pb")
+        let root = new p.root()
+        root.setVideoid(id)
+        root.setRacycheckok(1)
+        root.setContentcheckok(1)
+        root.setPps("YAHIAQHwBAH4BAGiBhUBRjgLxeEsOtiCEU04oesIlhrQEA8%3D")
+        let context = new p.root.contextType()
+        let client = new p.root.contextType.clientType()
+        client.setDevicemake("Google")
+        client.setDevicemodel("Android SDK built for x86")
+        client.setClientnumber(3) // ANDROID
+        client.setClientversion("20.06.36")
+        client.setOsname("Android")
+        client.setOsversion("10")
+        let hw = new p.hwData()
+        hw.setId(1398091118)
+        client.addHw(hw)
+        client.setGl("US")
+        client.setPlreq("4001214430065260964")
+        client.setScreenwidth(411)
+        client.setScreenheight(683)
+        client.setScreenwidth2(411)
+        client.setScreenheight2(683)
+        client.setUtcoffsetminutes(60)
+        client.setTimezone("Europe/Warsaw")
+        client.setDevicecodename("ranchu;")
+        let configInfo = new p.appConfig()
+        configInfo.setColdhashdata(cfg.coldHashData || "")
+        configInfo.setHothashdata(cfg.hotHashData || "")
+        client.addConfiginfo(configInfo)
+        let adSignals = new p.adSignalsMsg()
+        adSignals.addSignal(1068);adSignals.addSignal(332)
+        adSignals.addSignal(506);adSignals.addSignal(1098)
+        adSignals.addSignal(1015);adSignals.addSignal(1703)
+        adSignals.addSignal(19);adSignals.addSignal(549)
+        adSignals.addSignal(902);adSignals.addSignal(1838)
+        client.addAdsignals(adSignals)
+        context.addClient(client)
+        root.addContext(context)
+        let ovs = new p.root.otherVariousSets()
+        ovs.setDatasaving(0)
+        ovs.setTwo(2)
+        ovs.setInittimems(Date.now())
+        root.addSets(ovs)
+        callback(root.serializeBinary())
+    })},
+
+    "getYtConfig": function(callback) {
+        if(ytConfigData) {
+            callback(ytConfigData)
+            return;
+        } else {
+            let headers = JSON.parse(JSON.stringify(androidHeaders))
+            headers["user-agent"] = [
+                "com.google.android.youtube/20.06.36",
+                "(Linux; U; Android 14; en_US; Android SDK built for x86 Build",
+                "/QSR1.190920.001) gzip"
+            ].join("")
+            if(yt2009signin.needed()) {
+                let auth = "Bearer " + yt2009signin.getData().yAuth
+                headers["Authorization"] = auth;
+            }
+            fetch("https://www.youtube.com/youtubei/v1/config", {
+                "headers": headers,
+                "method": "POST",
+                "body": JSON.stringify({
+                    "context": {
+                        "client": {
+                            "androidSdkVersion": 34,
+                            "clientName": "ANDROID",
+                            "clientVersion": "20.06.36"
+                        }
+                    }
+                })
+            }).then(r => {r.json().then(r => {
+                if(r.responseContext && r.responseContext.globalConfigGroup) {
+                    let cfg = r.responseContext.globalConfigGroup;
+                    ytConfigData = {}
+                    if(cfg.hotHashData) {
+                        ytConfigData.hotHashData = cfg.hotHashData
+                    }
+                    if(cfg.coldHashData) {
+                        ytConfigData.coldHashData = cfg.coldHashData
+                    }
+                    ytConfigData.fi = 1
+                    callback(ytConfigData)
+                } else {
+                    ytConfigData = {"f": 1}
+                    callback(ytConfigData)
+                }
+            })})
+        }
+    },
+
+    "dataApiBulk": function(ids, requestedData, callback) {
+        let results = {}
+        if(!config.data_api_key) {
+            callback({})
+            return;
+        }
+
+        if(typeof(ids) == "object") {
+            ids = ids.join(",")
+        }
+
+        let requestedParts = []
+        if(typeof(requestedData) == "string") {
+            requestedData = requestedData.split(",")
+        }
+        requestedData.forEach(part => {
+            switch(part) {
+                case "publishedAt":
+                case "channelId":
+                case "title":
+                case "description":
+                case "thumbnails":
+                case "tags":
+                case "categoryId":
+                case "channelTitle": {
+                    if(!requestedParts.includes("snippet")) {
+                        requestedParts.push("snippet")
+                    }
+                    break;
+                }
+                case "viewCount":
+                case "likeCount":
+                case "commentCount": {
+                    if(!requestedParts.includes("statistics")) {
+                        requestedParts.push("statistics")
+                    }
+                    break;
+                }
+            }
+        })
+
+        requestedParts = requestedParts.join(",")
+
+        let url = [
+            "https://www.googleapis.com/youtube/v3/videos",
+            "?part=" + requestedParts,
+            "&id=" + ids,
+            "&key=" + config.data_api_key
+        ].join("")
+        
+        fetch(url, {
+            "headers": constants.headers,
+            "method": "GET"
+        }).then(r => {try {r.json().then(r => {
+            if(!r.error && r.items) {
+                r.items.forEach(item => {
+                    let neededData = {}
+                    requestedData.forEach(property => {
+                        if(item.snippet && item.snippet[property]) {
+                            neededData[property] = item.snippet[property]
+                        } else if(item.statistics && item.statistics[property]) {
+                            neededData[property] = item.statistics[property]
+                        }
+                    })
+                    results[item.id] = neededData
+                })
+
+                callback(results)
+                return;
+            }
+            callback(results)
+        })}catch(error){
+            callback(results)
+        }})
     }
 }
 

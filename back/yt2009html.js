@@ -171,7 +171,7 @@ module.exports = {
             }
         }
         rHeaders["user-agent"] = "com.google.android.youtube/19.02.39 (Linux; U; Android 14) gzip"
-        fetch(`https://www.youtube.com/youtubei/v1/player?key=${api_key}`, {
+        fetch(`https://www.youtube.com/youtubei/v1/player?prettyPrint=false`, {
             "headers": rHeaders,
             "referrer": `https://www.youtube.com/`,
             "referrerPolicy": "strict-origin-when-cross-origin",
@@ -189,6 +189,12 @@ module.exports = {
                 if(r.streamingData) {
                     yt2009exports.extendWrite("players", id, r)
                 }
+                setTimeout(() => {
+                    // delete cached player after 15 minutes if still there
+                    if(yt2009exports.read().players[id]) {
+                        yt2009exports.delete("players", id)
+                    }
+                }, 1000 * 60 * 15)
                 combinedResponse.freezeSync = true;
                 // ^ overriden when category pull done successfully
             }
@@ -252,6 +258,7 @@ module.exports = {
             }
             this.innertube_get_data(id, (videoData => {
                 let fetchesCompleted = 0;
+                let fetchesRequired = 3;
 
                 let data = {}
                 try {
@@ -331,6 +338,7 @@ module.exports = {
                                       .videoSecondaryInfoRenderer
                                       .owner.videoOwnerRenderer
                                       .thumbnail.thumbnails[1].url
+                    data.author_img = yt2009utils.saveAvatar(data.author_img)
                 }
                 catch(error) {
                     data.author_img = "default"
@@ -347,6 +355,12 @@ module.exports = {
                                       .videoPrimaryInfoRenderer.dateText.simpleText
                         if(data.upload.includes(" on ")) {
                             data.upload = data.upload.split(" on ")[1]
+                        }
+                        if(data.upload.includes(" ago")) {
+                            // relative date (streams etc)
+                            data.upload = yt2009utils.relativeToAbsoluteApprox(
+                                data.upload
+                            )
                         }
                     }
                     catch(error) {
@@ -379,6 +393,13 @@ module.exports = {
                     data.freezeSync = true;
                 }
 
+                // unplayable check (country restriction/members only)
+                // still gets data
+                if(videoData.playabilityStatus
+                && videoData.playabilityStatus.status == "UNPLAYABLE") {
+                    data.unplayable = true;
+                }
+
                 // "related" videos
 
                 let related = []
@@ -402,6 +423,7 @@ module.exports = {
                 && related[1].itemSectionRenderer.contents) {
                     related = related[1].itemSectionRenderer.contents
                 }
+                let viewmodelViewCountFails = []
                 related.forEach(video => {
                     if(video.lockupViewModel
                     && video.lockupViewModel.contentType == "LOCKUP_CONTENT_TYPE_VIDEO") {
@@ -410,14 +432,19 @@ module.exports = {
                         let metadata = video.metadata.lockupMetadataViewModel;
                         let id = video.contentId
                         let title = metadata.title.content
-                        let viewCount = video.rendererContext
-                                        .accessibilityContext.label
-                                        .split(" views");
-                        viewCount = viewCount[viewCount.length - 2].split(" ");
-                        viewCount = viewCount[viewCount.length - 1] + " views";
                         let creatorUrl = "UC" + JSON.stringify(video)
                                                 .split(`browseId":"UC`)[1]
                                                 .split(`"`)[0];
+                        let creatorHandle = null;
+                        try {
+                            let tc = JSON.stringify(video)
+                                     .split(`canonicalBaseUrl":"/@`)[1]
+                                     .split(`"`)[0];
+                            if(tc) {
+                                creatorHandle = tc;
+                            }
+                        }
+                        catch(error) {}
                         let metadataParts = []
                         let mrPath = metadata.metadata.contentMetadataViewModel
                                              .metadataRows;
@@ -427,6 +454,33 @@ module.exports = {
                                 catch(error){}
                             })}
                         })
+                        let viewCount = metadataParts.filter(s => {
+                            return s.includes(" views")
+                        })[0]
+                        if(viewCount) {
+                            viewCount = yt2009utils.approxSubcount(
+                                viewCount.split(" ")[0]
+                            ) + " views"
+                        } else {
+                            viewCount = "0 views"
+                        }
+                        try {
+                            let tvc = video.rendererContext
+                                      .accessibilityContext.label
+                                      .split(" views");
+                            tvc = tvc[viewCount.length - 2].split(" ");
+                            tvc = tvc[viewCount.length - 1] + " views"
+
+                            // full viewcount in accessibility data, use that
+                            if(tvc && !isNaN(parseInt(tvc.split(" ")[0]))) {
+                                viewCount = tvc;
+                            }
+                        }
+                        catch(error){
+                            viewmodelViewCountFails.push(id)
+                            let bvc = viewCount.split(" ")[0]
+                            viewCount = yt2009utils.countBreakup(bvc) + " views"
+                        }
                         let creatorName = metadataParts[0]
                         let upload = metadataParts[2]
                         let time = "1:00"
@@ -442,6 +496,8 @@ module.exports = {
                             })
                         }
                         catch(error){}
+                        if(time.toLowerCase().includes("live")
+                        || time.toLowerCase().includes("short")) return;
                         data.related.push({
                             "id": id,
                             "title": title,
@@ -449,6 +505,7 @@ module.exports = {
                             "length": time,
                             "creatorName": creatorName,
                             "creatorUrl": "/channel/" + creatorUrl,
+                            "creatorHandle": creatorHandle,
                             "uploaded": upload
                         })
                         return;
@@ -476,6 +533,11 @@ module.exports = {
                                         .browseEndpoint.canonicalBaseUrl
                     })
 
+                    let creatorHandle = null;
+                    if(creatorUrl.startsWith("/@")) {
+                        creatorHandle = creatorUrl.split("/@")[1]
+                    }
+
                     if(!creatorUrl.startsWith("/c/")
                     && !creatorUrl.startsWith("/user/")
                     && !creatorUrl.startsWith("/channel/")) {
@@ -483,6 +545,12 @@ module.exports = {
                                                     .navigationEndpoint
                                                     .browseEndpoint.browseId
                     }
+
+                    if(!video.lengthText.simpleText
+                    || video.lengthText.simpleText.toLowerCase()
+                            .includes("live")
+                    || video.lengthText.simpleText.toLowerCase()
+                            .includes("short")) return;
                     try {
                         data.related.push({
                             "title": video.title.simpleText,
@@ -491,6 +559,7 @@ module.exports = {
                             "length": video.lengthText.simpleText,
                             "creatorName": creatorName,
                             "creatorUrl": creatorUrl,
+                            "creatorHandle": creatorHandle,
                             "uploaded": video.publishedTimeText.simpleText
                         })
                     }
@@ -498,6 +567,51 @@ module.exports = {
                         
                     }
                 })
+                if(viewmodelViewCountFails.length >= 1 && config.data_api_key) {
+                    fetchesRequired++
+                    // fallback fetch full viewcount through data api
+                    if(config.env == "dev") {
+                        console.log(
+                            "viewmodel related lack full viewcounts",
+                            "// data api fetch!!"
+                        )
+                    }
+                    let dataApiUrl = [
+                        "https://www.googleapis.com/youtube/v3/videos",
+                        "?part=statistics&id=" + viewmodelViewCountFails.join(),
+                        "&key=" + config.data_api_key
+                    ].join("")
+                    fetch(dataApiUrl, {
+                        "headers": constants.headers,
+                        "method": "GET"
+                    }).then(r => {try {r.json().then(r => {
+                        if(!r.error && r.items) {
+                            r.items.forEach(v => {
+                                let rel = data.related.filter(s => {
+                                    return s.id == v.id
+                                })[0]
+                                let i = data.related.indexOf(rel)
+                                if(i !== null && i !== undefined && i >= 0
+                                && v.statistics && v.statistics.viewCount) {
+                                    let vc = parseInt(v.statistics.viewCount)
+                                    vc = yt2009utils.countBreakup(vc)
+                                    vc += " views"
+                                    data.related[i].views = vc;
+                                }
+                            })
+                        }
+                        fetchesCompleted++;
+                        if(fetchesCompleted >= fetchesRequired) {
+                            callback(data)
+                        }
+                    })}catch(error){
+                        console.log(error)
+                        fetchesCompleted++;
+                        if(fetchesCompleted >= fetchesRequired) {
+                            callback(data)
+                        }
+                    }})
+                }
 
                 // save channel image
 
@@ -508,7 +622,7 @@ module.exports = {
                     data.author_img = yt2009utils.saveAvatar(data.author_img, false)
                 }
                 fetchesCompleted++;
-                if(fetchesCompleted >= 3) {
+                if(fetchesCompleted >= fetchesRequired) {
                     callback(data)
                 }
             
@@ -538,7 +652,7 @@ module.exports = {
                     (comment_data) => {
                         data.comments = comment_data
                         fetchesCompleted++;
-                        if(fetchesCompleted >= 3) {
+                        if(fetchesCompleted >= fetchesRequired) {
                             callback(data)
                         }
                     }
@@ -574,7 +688,7 @@ module.exports = {
                                 (error, stdout, stderr) => {
                                     data.mp4 = `/assets/${id}`
                                     fetchesCompleted++;
-                                    if(fetchesCompleted >= 3) {
+                                    if(fetchesCompleted >= fetchesRequired) {
                                         callback(data)
                                     }  
                                 }
@@ -586,7 +700,7 @@ module.exports = {
                                 data.mp4 = `/assets/${id}`
                             }
                             fetchesCompleted++;
-                            if(fetchesCompleted >= 3) {
+                            if(fetchesCompleted >= fetchesRequired) {
                                 callback(data)
                             }
                             cache.write(id, data)
@@ -608,7 +722,7 @@ module.exports = {
                 } else {
                     data.mp4 = `/assets/${id}`
                     fetchesCompleted++;
-                    if(fetchesCompleted >= 3) {
+                    if(fetchesCompleted >= fetchesRequired) {
                         callback(data)
                     }
                     cache.write(id, data);
@@ -761,6 +875,14 @@ module.exports = {
             }
         }
 
+        // unplayable state
+        if(data.unplayable && !useFlash) {
+            code = code.replace(
+                `//yt2009-unplay`,
+                `showUnrecoverableError("This video is unavailable.")`
+            )
+        }
+
         // login_simulate comments
         if(req.headers.cookie.includes("login_simulate")
         && !req.headers.cookie.includes("relay_key")) {
@@ -804,7 +926,10 @@ module.exports = {
             }
         }
         if(custom_comments[data.id]) {
-            custom_comments.forEach(c => {vCustomComments.push(c)})
+            try {
+                custom_comments.forEach(c => {vCustomComments.push(c)})
+            }
+            catch(error){}
         }
         if(vCustomComments.length >= 1) {
             let commentsHTML = ""
@@ -1956,9 +2081,9 @@ https://web.archive.org/web/20091111/http://www.youtube.com/watch?v=${data.id}`
                 }
 
                 .endscreen-video {
-                    background-image: url(/player-imgs/darker-bg.png);
-                    background-size: contain;
-                    -moz-background-size: contain;
+                    background-image: url(/player-imgs/endscreen-bg-opt.png);
+                    overflow: hidden;
+                    background-repeat: repeat-x;
                 }
                 </style>
                 `
@@ -2535,7 +2660,8 @@ https://web.archive.org/web/20091111/http://www.youtube.com/watch?v=${data.id}`
 
                     // add old defualt "related" videos at the end
                     data.related.forEach(video => {
-                        if(parseInt(video.uploaded.split(" ")[0]) >= 12
+                        if(video.uploaded
+                        && parseInt(video.uploaded.split(" ")[0]) >= 12
                         && video.uploaded.includes("years")
                         && !html.includes(`data-id="${video.id}"`)) {
                             // only 12 years or older & no repeats

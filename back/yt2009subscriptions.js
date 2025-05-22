@@ -154,6 +154,17 @@ module.exports = {
 
     "fetch_new_videos": function(req, res, sendRawData) {
         let url = req.headers.url;
+        if(!url) {
+            if(res.status) {
+                res.status(400)
+            }
+            if(sendRawData) {
+                res.send({"time": Date.now(), "videos": []})
+            } else {
+                res.send("")
+            }
+            return;
+        }
         if(url.startsWith("http")) {
             let prefix = url.split("/channel/")[0]
                             .split("/user/")[0]
@@ -230,6 +241,20 @@ module.exports = {
                                 "simpleText": ""
                             }
                         }
+
+                        let badges = []
+                        if(video.badges) {
+                            try {
+                                video.badges.forEach(badge => {
+                                    if(badge.metadataBadgeRenderer) {
+                                        badge = badge.metadataBadgeRenderer
+                                        badges.push(badge.style)
+                                    }
+                                })
+                            }
+                            catch(error){}
+                        }
+
                         data.videos.push({
                             "id": video.videoId,
                             "title": video.title.runs[0].text,
@@ -242,7 +267,8 @@ module.exports = {
                                         + video.videoId
                                         + thumbUrl,
                             "time": video.lengthText ?
-                                    video.lengthText.simpleText : "3:52"
+                                    video.lengthText.simpleText : "3:52",
+                            "badges": badges
                         })
                     }
                 })
@@ -261,7 +287,14 @@ module.exports = {
     "parse_new_videos": function(data, flags) {
         let html = ``
         let videoIndex = 0;
-        data.videos.forEach(video => {
+
+        let videosSource = data.videos;
+        videosSource = videosSource.filter(s => {return !(
+            s.badges
+            && s.badges.includes("BADGE_STYLE_TYPE_MEMBERS_ONLY")
+        )})
+
+        videosSource.forEach(video => {
             html += templates.subscriptionVideo(video, flags, videoIndex)
             videoIndex++;
             if(videoIndex > 10) {
